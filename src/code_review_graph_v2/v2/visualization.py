@@ -117,6 +117,51 @@ class Visualizer:
 
         return timeline
 
+    def _select_graph_subset(
+        self,
+        viz: GraphVisualization,
+        max_nodes: int = 200,
+    ) -> tuple[list[dict], list[dict]]:
+        """Select a connected subset of nodes + matching edges for rendering.
+
+        Prioritises highlighted nodes and those with the most connections so the
+        visualisation shows the most informative part of the graph.
+        """
+        all_nodes = viz.nodes
+        all_edges = viz.edges
+
+        if len(all_nodes) <= max_nodes:
+            # Small enough to render everything – just filter orphan edges
+            node_ids = {n["id"] for n in all_nodes}
+            valid_edges = [
+                e for e in all_edges
+                if e["source"] in node_ids and e["target"] in node_ids
+            ]
+            return all_nodes, valid_edges
+
+        # Count connections per node
+        conn: dict[str, int] = {}
+        for e in all_edges:
+            conn[e["source"]] = conn.get(e["source"], 0) + 1
+            conn[e["target"]] = conn.get(e["target"], 0) + 1
+
+        # Always include highlighted nodes, then most-connected
+        highlighted = [n for n in all_nodes if n.get("highlighted")]
+        others = sorted(
+            [n for n in all_nodes if not n.get("highlighted")],
+            key=lambda n: conn.get(n["id"], 0),
+            reverse=True,
+        )
+        selected = highlighted + others[: max_nodes - len(highlighted)]
+        selected = selected[:max_nodes]
+
+        node_ids = {n["id"] for n in selected}
+        valid_edges = [
+            e for e in all_edges
+            if e["source"] in node_ids and e["target"] in node_ids
+        ]
+        return selected, valid_edges
+
     def export_html(
         self,
         graph: "GraphV2",
@@ -127,6 +172,9 @@ class Visualizer:
         viz = self.generate_interactive_graph(graph, [p.file_path for p in impact_predictions])
         flow_viz = self.generate_flow_diagram(flows)
         timeline = self.generate_impact_timeline(impact_predictions)
+
+        # Select a renderable subset (nodes + only edges that reference them)
+        render_nodes, render_edges = self._select_graph_subset(viz, max_nodes=200)
 
         html = f'''<!DOCTYPE html>
 <html>
@@ -143,7 +191,17 @@ class Visualizer:
         .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }}
         .card {{ background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }}
         .card h2 {{ color: #38bdf8; font-size: 1.1rem; margin-bottom: 15px; }}
-        #graph-container {{ height: 400px; background: #0f172a; border-radius: 8px; }}
+        #graph-container {{ height: 500px; background: #0f172a; border-radius: 8px; overflow: hidden; position: relative; }}
+        .graph-toolbar {{ display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }}
+        .graph-toolbar input {{ background: #334155; border: 1px solid #475569; color: #e2e8f0; padding: 6px 12px; border-radius: 6px; font-size: 0.85rem; width: 220px; }}
+        .graph-toolbar input::placeholder {{ color: #64748b; }}
+        .graph-toolbar button {{ background: #334155; border: 1px solid #475569; color: #e2e8f0; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }}
+        .graph-toolbar button:hover {{ background: #475569; }}
+        .graph-info {{ position: absolute; bottom: 8px; right: 12px; color: #64748b; font-size: 0.7rem; pointer-events: none; }}
+        .tooltip {{ position: absolute; background: #1e293b; border: 1px solid #475569; border-radius: 8px; padding: 10px 14px; font-size: 0.8rem; pointer-events: none; opacity: 0; transition: opacity 0.15s; z-index: 10; max-width: 300px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }}
+        .tooltip .tt-name {{ font-weight: 600; color: #38bdf8; margin-bottom: 4px; }}
+        .tooltip .tt-file {{ color: #94a3b8; font-size: 0.75rem; word-break: break-all; }}
+        .tooltip .tt-type {{ display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; margin-top: 4px; }}
         .flow-item {{ display: flex; align-items: center; padding: 10px; margin: 8px 0; background: #334155; border-radius: 6px; }}
         .flow-badge {{ padding: 4px 10px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; margin-right: 12px; }}
         .flow-name {{ flex: 1; font-weight: 500; }}
@@ -152,20 +210,19 @@ class Visualizer:
         .impact-score {{ font-weight: 700; font-size: 1.1rem; }}
         .impact-file {{ font-weight: 500; }}
         .impact-reasons {{ color: #94a3b8; font-size: 0.75rem; }}
-        .stats {{ display: flex; gap: 20px; margin-bottom: 20px; }}
+        .stats {{ display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }}
         .stat {{ background: #1e293b; padding: 15px 25px; border-radius: 8px; border: 1px solid #334155; }}
         .stat-value {{ font-size: 1.5rem; font-weight: 700; color: #38bdf8; }}
         .stat-label {{ color: #94a3b8; font-size: 0.85rem; }}
-        .legend {{ display: flex; gap: 15px; margin-top: 10px; }}
+        .legend {{ display: flex; gap: 15px; margin-top: 10px; flex-wrap: wrap; }}
         .legend-item {{ display: flex; align-items: center; gap: 6px; font-size: 0.8rem; }}
         .legend-dot {{ width: 10px; height: 10px; border-radius: 50%; }}
-        svg line {{ stroke: #475569; stroke-width: 1; }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🔍 Code Review Graph v2</h1>
-        
+
         <div class="stats">
             <div class="stat">
                 <div class="stat-value">{viz.metadata["total_nodes"]}</div>
@@ -174,6 +231,10 @@ class Visualizer:
             <div class="stat">
                 <div class="stat-value">{viz.metadata["total_edges"]}</div>
                 <div class="stat-label">Edges</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{len(render_nodes)}</div>
+                <div class="stat-label">Rendered</div>
             </div>
             <div class="stat">
                 <div class="stat-value">{len(flow_viz.flows)}</div>
@@ -191,13 +252,20 @@ class Visualizer:
                 <div class="legend">
                     <div class="legend-item"><div class="legend-dot" style="background:#38bdf8"></div>Function</div>
                     <div class="legend-item"><div class="legend-dot" style="background:#a78bfa"></div>Class</div>
-                    <div class="legend-item"><div class="legend-dot" style="background:#fb923c"></div>Import</div>
+                    <div class="legend-item"><div class="legend-dot" style="background:#fb923c"></div>Module</div>
                     <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>Highlighted</div>
                 </div>
-                <div id="graph-container"></div>
+                <div class="graph-toolbar">
+                    <input type="text" id="search-input" placeholder="Search nodes…" />
+                    <button id="btn-reset">Reset zoom</button>
+                </div>
+                <div id="graph-container">
+                    <div class="tooltip" id="tooltip"></div>
+                    <div class="graph-info">Showing {len(render_nodes)} of {viz.metadata["total_nodes"]} nodes · Scroll to zoom · Drag to pan</div>
+                </div>
             </div>
-            
-            <div class="card">
+
+            <div class="card" style="max-height:620px;overflow-y:auto;">
                 <h2>🌊 Execution Flows</h2>
                 <div class="legend">
                     <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>Critical</div>
@@ -206,7 +274,7 @@ class Visualizer:
                     <div class="legend-item"><div class="legend-dot" style="background:#22c55e"></div>Low</div>
                 </div>
                 <div id="flows-container">
-                    {self._render_flows(flow_viz.flows[:10])}
+                    {self._render_flows(flow_viz.flows[:20])}
                 </div>
             </div>
         </div>
@@ -220,68 +288,141 @@ class Visualizer:
     </div>
 
     <script>
-        const nodes = {json.dumps(viz.nodes[:50])};
-        const edges = {json.dumps(viz.edges[:100])};
-        
-        const width = document.getElementById('graph-container').clientWidth;
-        const height = 380;
-        
+        // ── Data ──
+        const nodes = {json.dumps(render_nodes)};
+        const edges = {json.dumps(render_edges)};
+
+        // ── Dimensions ──
+        const container = document.getElementById('graph-container');
+        const width  = container.clientWidth  || 600;
+        const height = container.clientHeight || 480;
+
+        // ── SVG + zoom ──
         const svg = d3.select('#graph-container')
             .append('svg')
             .attr('width', width)
             .attr('height', height);
-        
+
+        const g = svg.append('g');   // zoomable root group
+
+        const zoom = d3.zoom()
+            .scaleExtent([0.15, 5])
+            .on('zoom', (event) => g.attr('transform', event.transform));
+        svg.call(zoom);
+
+        document.getElementById('btn-reset').addEventListener('click', () => {{
+            svg.transition().duration(500).call(zoom.transform, d3.zoomIdentity);
+        }});
+
+        // ── Colour helper ──
+        function nodeColor(d) {{
+            if (d.highlighted) return '#ef4444';
+            if (d.type === 'class')    return '#a78bfa';
+            if (d.type === 'function') return '#38bdf8';
+            return '#fb923c';
+        }}
+
+        // ── Simulation ──
         const simulation = d3.forceSimulation(nodes)
-            .force('link', d3.forceLink(edges).id(d => d.id).distance(60))
-            .force('charge', d3.forceManyBody().strength(-150))
-            .force('center', d3.forceCenter(width / 2, height / 2));
-        
-        const link = svg.append('g')
+            .force('link', d3.forceLink(edges).id(d => d.id).distance(70))
+            .force('charge', d3.forceManyBody().strength(-120))
+            .force('center', d3.forceCenter(width / 2, height / 2))
+            .force('collision', d3.forceCollide().radius(14));
+
+        // ── Links ──
+        const link = g.append('g')
+            .attr('stroke-opacity', 0.35)
             .selectAll('line')
             .data(edges)
-            .enter().append('line');
-        
-        const node = svg.append('g')
+            .enter().append('line')
+            .attr('stroke', '#475569')
+            .attr('stroke-width', 1);
+
+        // ── Nodes ──
+        const node = g.append('g')
             .selectAll('circle')
             .data(nodes)
             .enter().append('circle')
-            .attr('r', d => d.highlighted ? 10 : 6)
-            .attr('fill', d => {{
-                if (d.highlighted) return '#ef4444';
-                if (d.type === 'function') return '#38bdf8';
-                if (d.type === 'class') return '#a78bfa';
-                return '#fb923c';
-            }})
+            .attr('r', d => d.highlighted ? 9 : 5)
+            .attr('fill', nodeColor)
+            .attr('stroke', d => d.highlighted ? '#fca5a5' : 'transparent')
+            .attr('stroke-width', 2)
+            .style('cursor', 'pointer')
             .call(d3.drag()
                 .on('start', dragstarted)
                 .on('drag', dragged)
                 .on('end', dragended));
-        
-        node.append('title').text(d => d.label);
-        
+
+        // ── Labels (only for larger/highlighted nodes) ──
+        const label = g.append('g')
+            .selectAll('text')
+            .data(nodes)
+            .enter().append('text')
+            .text(d => d.label.length > 22 ? d.label.slice(0, 20) + '…' : d.label)
+            .attr('font-size', 9)
+            .attr('fill', '#94a3b8')
+            .attr('dx', 10)
+            .attr('dy', 3)
+            .style('pointer-events', 'none');
+
+        // ── Tooltip ──
+        const tooltip = d3.select('#tooltip');
+
+        node.on('mouseover', (event, d) => {{
+            const typeColors = {{ function: '#38bdf8', class: '#a78bfa', module: '#fb923c' }};
+            const bg = typeColors[d.type] || '#fb923c';
+            tooltip.html(
+                '<div class="tt-name">' + d.label + '</div>' +
+                '<div class="tt-file">' + d.file + ':' + d.line + '</div>' +
+                '<span class="tt-type" style="background:' + bg + '22;color:' + bg + '">' + d.type + '</span>'
+            )
+            .style('left', (event.offsetX + 14) + 'px')
+            .style('top',  (event.offsetY - 10) + 'px')
+            .style('opacity', 1);
+        }})
+        .on('mouseout', () => tooltip.style('opacity', 0));
+
+        // ── Tick ──
         simulation.on('tick', () => {{
             link
                 .attr('x1', d => d.source.x)
                 .attr('y1', d => d.source.y)
                 .attr('x2', d => d.target.x)
                 .attr('y2', d => d.target.y);
-            
             node
-                .attr('cx', d => d.x = Math.max(10, Math.min(width - 10, d.x)))
-                .attr('cy', d => d.y = Math.max(10, Math.min(height - 10, d.y)));
+                .attr('cx', d => d.x)
+                .attr('cy', d => d.y);
+            label
+                .attr('x', d => d.x)
+                .attr('y', d => d.y);
         }});
-        
+
+        // ── Search ──
+        const searchInput = document.getElementById('search-input');
+        searchInput.addEventListener('input', () => {{
+            const q = searchInput.value.toLowerCase();
+            if (!q) {{
+                node.attr('opacity', 1).attr('r', d => d.highlighted ? 9 : 5);
+                label.attr('opacity', 1);
+                link.attr('stroke-opacity', 0.35);
+                return;
+            }}
+            node.attr('opacity', d => d.label.toLowerCase().includes(q) ? 1 : 0.1)
+                .attr('r', d => d.label.toLowerCase().includes(q) ? 12 : 4);
+            label.attr('opacity', d => d.label.toLowerCase().includes(q) ? 1 : 0.05);
+            link.attr('stroke-opacity', 0.08);
+        }});
+
+        // ── Drag helpers ──
         function dragstarted(event) {{
             if (!event.active) simulation.alphaTarget(0.3).restart();
             event.subject.fx = event.subject.x;
             event.subject.fy = event.subject.y;
         }}
-        
         function dragged(event) {{
             event.subject.fx = event.x;
             event.subject.fy = event.y;
         }}
-        
         function dragended(event) {{
             if (!event.active) simulation.alphaTarget(0);
             event.subject.fx = null;

@@ -160,14 +160,27 @@ class CodeReviewGraphV2:
         }
 
 
-_graph_instance: CodeReviewGraphV2 | None = None
+_graph_cache: dict[str, CodeReviewGraphV2] = {}
+_current_data_dir: Path | None = None
 
 
 def get_graph(data_dir: Path | None = None) -> CodeReviewGraphV2:
-    global _graph_instance
-    if _graph_instance is None:
-        _graph_instance = CodeReviewGraphV2(data_dir)
-    return _graph_instance
+    """Get or create a graph instance for the given data directory.
+
+    Uses a per-project cache so each project keeps its own graph.
+    Falls back to the most recently built project, or ``~/.code-review-graph-v2``.
+    """
+    global _current_data_dir
+
+    if data_dir is None:
+        import os
+        env_dir = os.environ.get("CRG_V2_DATA_DIR")
+        data_dir = _current_data_dir or (Path(env_dir) if env_dir else Path.home() / ".code-review-graph-v2")
+
+    key = str(data_dir.resolve())
+    if key not in _graph_cache:
+        _graph_cache[key] = CodeReviewGraphV2(data_dir)
+    return _graph_cache[key]
 
 
 # ---------------------------------------------------------------------------
@@ -187,8 +200,12 @@ def build_graph(root_path: str | None = None) -> dict[str, Any]:
     Returns parse statistics including files parsed, nodes/edges created,
     and how many files were skipped as unchanged.
     """
+    global _current_data_dir
+
     root = Path(root_path) if root_path else Path.cwd()
-    graph = get_graph(root.parent)
+    data_dir = root / ".code-review-graph-v2"
+    _current_data_dir = data_dir
+    graph = get_graph(data_dir)
     return graph.build_from_path(root)
 
 
