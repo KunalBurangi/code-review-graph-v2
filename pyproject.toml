@@ -1,0 +1,37 @@
+[project]
+name = "code-review-graph-v2"
+version = "2.0.0"
+description = "Intelligent code review context with ML-powered impact prediction"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0",
+    "tree-sitter>=0.21",
+    "httpx",
+    "orjson",
+    "aiofiles",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+code-review-graph-v2 = "code_review_graph_v2.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python-version = "3.11"
+ignore-missing-imports = true

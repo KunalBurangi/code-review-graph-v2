@@ -1,0 +1,36 @@
+from .v2 import (
+    build_graph,
+    get_impact_radius,
+    search_code,
+    record_search_feedback,
+    register_repository,
+    list_repositories,
+    get_cross_repo_impact,
+    get_review_context,
+    get_graph,
+    generate_visualization,
+    import_external_graph,
+    configure_auto_scan,
+    auto_detect_related_repos,
+    mcp,
+)
+
+__version__ = "2.0.0"
+
+__all__ = [
+    "build_graph",
+    "get_impact_radius",
+    "search_code",
+    "record_search_feedback",
+    "register_repository",
+    "list_repositories",
+    "get_cross_repo_impact",
+    "get_review_context",
+    "get_graph",
+    "generate_visualization",
+    "import_external_graph",
+    "configure_auto_scan",
+    "auto_detect_related_repos",
+    "mcp",
+    "__version__",
+]
