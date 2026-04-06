@@ -17,6 +17,8 @@ class CodeNode:
     end_line: int
     parent_id: str | None = None
     code_hash: str | None = None
+    parent_class: str | None = None
+    metadata: dict | None = field(default_factory=dict)
 
     @classmethod
     def compute_hash(cls, content: str) -> str:

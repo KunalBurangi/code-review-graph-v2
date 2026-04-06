@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,7 @@ class CodeReviewGraphV2:
             "edges_created": 0,
             "call_edges": 0,
             "import_edges": 0,
+            "cross_file_edges": 0,
             "flows_detected": 0,
             "git_files_with_history": 0,
         }
@@ -94,12 +96,115 @@ class CodeReviewGraphV2:
         git_stats = self.graph.load_git_history(root)
         stats["git_files_with_history"] = len(git_stats)
 
+        # ── Resolve cross-file imports ──
+        cross_file_edges = self._resolve_cross_file_imports(root)
+        for edge in cross_file_edges:
+            self.graph.add_edge(edge)
+        stats["cross_file_edges"] = len(cross_file_edges)
+
         self._save_graph()
         return stats
 
     def _should_skip(self, path: Path) -> bool:
-        skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
+        skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", "coverage", ".nyc_output"}
+        # Also skip coverage files
+        if "coverage" in path.parts or "lcov-report" in path.parts or ".nyc_output" in path.parts:
+            return True
         return any(part in skip_dirs for part in path.parts)
+    
+    def _resolve_cross_file_imports(self, root: Path) -> list[CodeEdge]:
+        """Resolve relative imports to actual file paths and create cross-file edges."""
+        from .parser import IMPORT_PATTERNS, LANGUAGE_EXTENSIONS
+        
+        cross_file_edges: list[CodeEdge] = []
+        seen: set[tuple[str, str]] = set()
+        
+        # Build a map of all exported nodes by file (with resolved paths for symlink matching)
+        exported_by_file: dict[str, list[CodeNode]] = {}
+        for node in self.graph.nodes.values():
+            if node.node_type in ("class", "function", "method"):
+                # Resolve the file path to handle symlinks
+                resolved_fp = str(Path(node.file_path).resolve())
+                if resolved_fp not in exported_by_file:
+                    exported_by_file[resolved_fp] = []
+                exported_by_file[resolved_fp].append(node)
+        
+        # Build a map of imports per file: file_path -> list of (imported_module_names, target_file_path)
+        file_imports: dict[str, list[tuple[str, Path]]] = {}
+        
+        # Iterate through all files and parse imports
+        for ext in LANGUAGE_EXTENSIONS:
+            for file_path in root.rglob(f"*{ext}"):
+                if self._should_skip(file_path):
+                    continue
+                
+                try:
+                    fp_str = str(file_path)
+                    if not any(n.file_path == fp_str for n in self.graph.nodes.values()):
+                        continue  # File wasn't parsed
+                    
+                    content = file_path.read_text(encoding="utf-8")
+                    lines = content.split("\n")
+                    
+                    import_patterns = IMPORT_PATTERNS.get(LANGUAGE_EXTENSIONS.get(ext), [])
+                    file_imports[fp_str] = []
+                    
+                    for i, line in enumerate(lines, start=1):
+                        for pattern in import_patterns:
+                            for match in re.finditer(pattern, line):
+                                if match.lastindex:
+                                    import_path = match.group(match.lastindex).split(",")[0].strip()
+                                    if not import_path or not import_path.startswith("."):
+                                        continue
+                                    
+                                    # Resolve relative path
+                                    resolved_path = (file_path.parent / import_path).resolve()
+                                    file_imports[fp_str].append((import_path, resolved_path))
+                
+                except Exception as exc:
+                    logger.debug("Failed to resolve imports in %s: %s", file_path, exc)
+        
+        # Now create edges between importing files and their imports
+        for importing_file, imports in file_imports.items():
+            for import_path, resolved_path in imports:
+                # Try different extensions to find the actual target file
+                target_file = None
+                for candidate_ext in [".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java"]:
+                    # Check if resolved_path is a directory
+                    if resolved_path.is_dir():
+                        candidate = resolved_path / f"index{candidate_ext}"
+                        if candidate.exists():
+                            target_file = str(candidate.resolve())
+                            break
+                    else:
+                        # Try with extension
+                        candidate = resolved_path.with_suffix(candidate_ext)
+                        if candidate.exists():
+                            target_file = str(candidate.resolve())
+                            break
+                        # Try as-is
+                        if resolved_path.exists():
+                            target_file = str(resolved_path)
+                            break
+                
+                if not target_file or target_file not in exported_by_file:
+                    continue
+                
+                # Create edges from all functions/classes in the importing file
+                # to all functions/classes in the imported file
+                for source_node in self.graph.nodes.values():
+                    if source_node.file_path == importing_file and source_node.node_type in ("class", "function", "method"):
+                        for target_node in exported_by_file[target_file]:
+                            key = (source_node.id, target_node.id)
+                            if key not in seen:
+                                seen.add(key)
+                                cross_file_edges.append(CodeEdge(
+                                    source_id=source_node.id,
+                                    target_id=target_node.id,
+                                    edge_type="imports",
+                                ))
+        
+        return cross_file_edges
 
     def _save_graph(self) -> None:
         graph_file = self.data_dir / "graph.json"

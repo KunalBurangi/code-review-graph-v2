@@ -49,14 +49,19 @@ FUNCTION_PATTERNS = {
         r"^(\s*)class\s+(\w+)",
     ],
     "javascript": [
+        r"^\s*(?:export\s+)?class\s+(\w+)",
         r"^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)",
         r"^\s*(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[^=])\s*=>",
         r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*(\w+)",
+        r"^\s*(?:public|private|protected)?\s*(?:static)?\s*(?:async\s+)?(\w+)\s*\(",
+        r"^\s*constructor\s*\(",
     ],
     "typescript": [
+        r"^\s*(?:export\s+)?class\s+(\w+)",
         r"^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)",
         r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[^=])\s*=>",
-        r"^\s*(?:export\s+)?(?:\s*(?:public|private|protected)\s+)*function\s+(\w+)",
+        r"^\s*(?:public|private|protected)?\s*(?:readonly)?\s*(?:static)?\s*(?:async\s+)?(\w+)\s*\(",
+        r"^\s*constructor\s*\(",
     ],
     "go": [
         r"^func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(",
@@ -316,21 +321,42 @@ def parse_file_v2(
     file_hash = CodeNode.compute_hash(content)
 
     node_by_line: dict[int, CodeNode] = {}
+    current_class: CodeNode | None = None
+    class_stack: list[CodeNode] = []  # Track nested classes
 
     for i, line in enumerate(lines, start=1):
+        # Determine current indentation level (for class scope tracking)
+        indent_level = len(line) - len(line.lstrip())
+        
+        # Pop class stack if we dedented out of current class
+        while class_stack and class_stack[-1].end_line == 0:
+            # Don't pop yet; end_line isn't set
+            break
+        
         for pattern in func_patterns:
             match = re.match(pattern, line)
             if match:
                 # Use last captured group — always the name across all patterns
-                # (Python patterns: group(1)=indent, group(2)=name;
-                #  JS/TS/Go patterns: group(1)=name)
                 name = match.group(match.lastindex) if match.lastindex else "anonymous"
-                is_class = "class" in pattern and "def" not in pattern
+                
+                # Special handling for constructor
+                if "constructor" in pattern and match.group(0):
+                    name = "constructor"
+                
+                is_class = "class" in pattern
                 node_type = "class" if is_class else "function"
 
                 # ── Compute real end_line ──
                 end_line_idx = _find_block_end(lines, i - 1, lang)  # 0-indexed
                 end_line = end_line_idx + 1  # convert to 1-indexed
+
+                # Determine if this is a method (inside a class)
+                parent_class = None
+                if not is_class and current_class:
+                    # Check if we're inside the current class's scope
+                    if i > current_class.start_line and i <= current_class.end_line:
+                        parent_class = current_class
+                        node_type = "method"
 
                 node = CodeNode(
                     id=f"{path}:{i}",
@@ -340,34 +366,45 @@ def parse_file_v2(
                     start_line=i,
                     end_line=end_line,
                     code_hash=file_hash,
+                    parent_class=parent_class.name if parent_class else None,
                 )
+                
                 nodes.append(node)
                 node_by_line[i] = node
+                
+                # Update current_class if this is a class definition
+                if is_class:
+                    current_class = node
+                    class_stack.append(node)
+                
                 break
 
     import_patterns = IMPORT_PATTERNS.get(lang, [])
     import_nodes: dict[str, CodeNode] = {}
+    import_statements: list[tuple[int, str, str]] = []  # (line_number, import_path, full_line)
 
     for i, line in enumerate(lines, start=1):
         for pattern in import_patterns:
             for match in re.finditer(pattern, line):
                 if match.lastindex:
                     module = match.group(match.lastindex).split(",")[0].strip()
-                    if module and module not in import_nodes:
-                        imp_node = CodeNode(
-                            id=f"import:{module}",
-                            name=module,
-                            node_type="import",
-                            file_path=str(path),
-                            start_line=i,
-                            end_line=i,
-                        )
-                        import_nodes[module] = imp_node
-                        nodes.append(imp_node)
+                    if module:
+                        import_statements.append((i, module, line))
+                        if module not in import_nodes:
+                            imp_node = CodeNode(
+                                id=f"import:{module}",
+                                name=module,
+                                node_type="import",
+                                file_path=str(path),
+                                start_line=i,
+                                end_line=i,
+                            )
+                            import_nodes[module] = imp_node
+                            nodes.append(imp_node)
 
     # ── Import edges: which functions use which imports ──
     for node in nodes:
-        if node.node_type in ("function", "class"):
+        if node.node_type in ("function", "class", "method"):
             # Use the real start/end range for checking import usage
             body_text = "\n".join(lines[node.start_line - 1 : node.end_line])
             for imp_module, imp_node in import_nodes.items():
@@ -381,8 +418,92 @@ def parse_file_v2(
     # ── Call edges: which functions call which functions ──
     call_edges = _detect_calls(lines, nodes, path)
     edges.extend(call_edges)
-
+    
+    # Store import statements for cross-file resolution
     return nodes, edges
+
+
+def resolve_cross_file_imports(
+    all_nodes: dict[str, CodeNode],
+    all_import_statements: dict[str, list[tuple[int, str, str]]],
+    root_path: Path,
+    lang: str,
+) -> list[CodeEdge]:
+    """Resolve import paths to actual files and create cross-file edges.
+    
+    Args:
+        all_nodes: Dict of all nodes by ID
+        all_import_statements: Dict of import statements per file
+        root_path: Root directory for relative path resolution
+        lang: Programming language
+    
+    Returns:
+        List of cross-file import edges
+    """
+    cross_file_edges: list[CodeEdge] = []
+    seen: set[tuple[str, str]] = set()
+    
+    for source_file, import_list in all_import_statements.items():
+        source_path = Path(source_file)
+        
+        for line_num, import_path, full_line in import_list:
+            # Skip external package imports (assume they contain /, are absolute, or don't resolve)
+            if not import_path.startswith(".") and not import_path.startswith("/"):
+                continue
+            
+            # Resolve relative import path
+            if import_path.startswith("."):
+                # Relative import: resolve from source file directory
+                resolved_path = (source_path.parent / import_path).resolve()
+            else:
+                # Absolute import
+                resolved_path = Path(import_path).resolve()
+            
+            # Try different extensions to find the actual file
+            extensions = [".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java"]
+            target_file = None
+            
+            # Check if it's a directory import (index file)
+            for ext in extensions:
+                if resolved_path.is_dir():
+                    candidate = resolved_path / f"index{ext}"
+                    if candidate.exists():
+                        target_file = candidate
+                        break
+                else:
+                    # Try the path as-is and with extensions
+                    if resolved_path.exists():
+                        target_file = resolved_path
+                        break
+                    candidate = resolved_path.with_suffix(ext)
+                    if candidate.exists():
+                        target_file = candidate
+                        break
+            
+            if not target_file:
+                continue
+            
+            # Find exported functions/classes in target file
+            target_file_str = str(target_file)
+            for node_id, node in all_nodes.items():
+                if node.file_path == target_file_str:
+                    if node.node_type in ("class", "function", "method"):
+                        # Find the importing node (function/class that uses this import)
+                        for import_node_id, import_node in all_nodes.items():
+                            if import_node.file_path == source_file:
+                                if import_node.node_type in ("class", "function", "method"):
+                                    # Check if this node uses the import
+                                    if import_node.start_line <= line_num <= import_node.end_line:
+                                        key = (import_node_id, node_id)
+                                        if key not in seen:
+                                            seen.add(key)
+                                            cross_file_edges.append(CodeEdge(
+                                                source_id=import_node_id,
+                                                target_id=node_id,
+                                                edge_type="imports",
+                                            ))
+    
+    return cross_file_edges
 
 
 def detect_flows_v2(
